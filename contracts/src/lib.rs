@@ -1,5 +1,35 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, symbol_short, vec, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, vec, Env, Map, Symbol, Vec};
+
+/// Blood type enumeration
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BloodType {
+    APositive,
+    ANegative,
+    BPositive,
+    BNegative,
+    ABPositive,
+    ABNegative,
+    OPositive,
+    ONegative,
+}
+
+/// Blood unit inventory record
+#[contracttype]
+#[derive(Clone)]
+pub struct BloodUnit {
+    pub id: u64,
+    pub blood_type: BloodType,
+    pub quantity: u32,
+    pub expiration_date: u64, // Unix timestamp
+    pub donor_id: Symbol,
+    pub location: Symbol,
+}
+
+/// Storage keys
+const BLOOD_UNITS: Symbol = symbol_short!("UNITS");
+const NEXT_ID: Symbol = symbol_short!("NEXT_ID");
 
 #[contract]
 pub struct HealthChainContract;
@@ -7,7 +37,7 @@ pub struct HealthChainContract;
 #[contractimpl]
 impl HealthChainContract {
     /// Initialize the contract
-    pub fn initialize(env: Env) -> Symbol {
+    pub fn initialize(_env: Env) -> Symbol {
         symbol_short!("init")
     }
 
@@ -17,13 +47,135 @@ impl HealthChainContract {
     }
 
     /// Retrieve stored record
-    pub fn get_record(env: Env, patient_id: Symbol) -> Symbol {
+    pub fn get_record(_env: Env, patient_id: Symbol) -> Symbol {
         patient_id
     }
 
     /// Verify record access
-    pub fn verify_access(env: Env, patient_id: Symbol, provider_id: Symbol) -> bool {
+    pub fn verify_access(_env: Env, _patient_id: Symbol, _provider_id: Symbol) -> bool {
         true
+    }
+
+    /// Add a blood unit to inventory
+    pub fn add_blood_unit(
+        env: Env,
+        blood_type: BloodType,
+        quantity: u32,
+        expiration_date: u64,
+        donor_id: Symbol,
+        location: Symbol,
+    ) -> u64 {
+        let id = Self::get_next_id(&env);
+
+        let unit = BloodUnit {
+            id,
+            blood_type,
+            quantity,
+            expiration_date,
+            donor_id,
+            location,
+        };
+
+        let mut units: Map<u64, BloodUnit> = env
+            .storage()
+            .persistent()
+            .get(&BLOOD_UNITS)
+            .unwrap_or(Map::new(&env));
+
+        units.set(id, unit);
+        env.storage().persistent().set(&BLOOD_UNITS, &units);
+
+        id
+    }
+
+    /// Query blood inventory by blood type with filters
+    pub fn query_by_blood_type(
+        env: Env,
+        blood_type: BloodType,
+        min_quantity: u32,
+        max_results: u32,
+    ) -> Vec<BloodUnit> {
+        let units: Map<u64, BloodUnit> = env
+            .storage()
+            .persistent()
+            .get(&BLOOD_UNITS)
+            .unwrap_or(Map::new(&env));
+
+        let current_time = env.ledger().timestamp();
+        let mut results = vec![&env];
+        let mut temp_units = vec![&env];
+
+        // Collect matching units (non-expired, matching blood type, sufficient quantity)
+        for (_, unit) in units.iter() {
+            if unit.blood_type == blood_type
+                && unit.quantity >= min_quantity
+                && unit.expiration_date > current_time
+            {
+                temp_units.push_back(unit);
+            }
+        }
+
+        // Sort by expiration date (FIFO - earliest expiration first)
+        let len = temp_units.len();
+        for i in 0..len {
+            for j in 0..len.saturating_sub(i + 1) {
+                let unit_j = temp_units.get(j).unwrap();
+                let unit_j_plus_1 = temp_units.get(j + 1).unwrap();
+
+                if unit_j.expiration_date > unit_j_plus_1.expiration_date {
+                    temp_units.set(j, unit_j_plus_1.clone());
+                    temp_units.set(j + 1, unit_j);
+                }
+            }
+        }
+
+        // Apply pagination
+        let limit = if max_results == 0 {
+            len
+        } else {
+            max_results.min(len)
+        };
+        for i in 0..limit {
+            if let Some(unit) = temp_units.get(i) {
+                results.push_back(unit);
+            }
+        }
+
+        results
+    }
+
+    /// Check if sufficient blood quantity is available
+    pub fn check_availability(env: Env, blood_type: BloodType, required_quantity: u32) -> bool {
+        let units: Map<u64, BloodUnit> = env
+            .storage()
+            .persistent()
+            .get(&BLOOD_UNITS)
+            .unwrap_or(Map::new(&env));
+
+        let current_time = env.ledger().timestamp();
+        let mut total_quantity: u32 = 0;
+
+        // Sum up available quantities for the blood type (non-expired only)
+        for (_, unit) in units.iter() {
+            if unit.blood_type == blood_type && unit.expiration_date > current_time {
+                total_quantity = total_quantity.saturating_add(unit.quantity);
+
+                // Early exit if we've found enough
+                if total_quantity >= required_quantity {
+                    return true;
+                }
+            }
+        }
+
+        total_quantity >= required_quantity
+    }
+
+    /// Helper function to get next ID
+    fn get_next_id(env: &Env) -> u64 {
+        let id: u64 = env.storage().persistent().get(&NEXT_ID).unwrap_or(1);
+
+        env.storage().persistent().set(&NEXT_ID, &(id + 1));
+        id
     }
 }
 
@@ -35,7 +187,7 @@ mod test {
     #[test]
     fn test_initialize() {
         let env = Env::default();
-        let contract_id = env.register_contract(None, HealthChainContract);
+        let contract_id = env.register(HealthChainContract, ());
         let client = HealthChainContractClient::new(&env, &contract_id);
 
         let result = client.initialize();
@@ -45,12 +197,12 @@ mod test {
     #[test]
     fn test_store_record() {
         let env = Env::default();
-        let contract_id = env.register_contract(None, HealthChainContract);
+        let contract_id = env.register(HealthChainContract, ());
         let client = HealthChainContractClient::new(&env, &contract_id);
 
         let patient = symbol_short!("patient1");
         let hash = symbol_short!("hash123");
-        
+
         let result = client.store_record(&patient, &hash);
         assert_eq!(result.len(), 2);
     }
@@ -58,13 +210,316 @@ mod test {
     #[test]
     fn test_verify_access() {
         let env = Env::default();
-        let contract_id = env.register_contract(None, HealthChainContract);
+        let contract_id = env.register(HealthChainContract, ());
         let client = HealthChainContractClient::new(&env, &contract_id);
 
         let patient = symbol_short!("patient1");
         let provider = symbol_short!("doctor1");
-        
+
         let has_access = client.verify_access(&patient, &provider);
         assert_eq!(has_access, true);
+    }
+
+    #[test]
+    fn test_add_blood_unit() {
+        let env = Env::default();
+        let contract_id = env.register(HealthChainContract, ());
+        let client = HealthChainContractClient::new(&env, &contract_id);
+
+        let id = client.add_blood_unit(
+            &BloodType::OPositive,
+            &100,
+            &(env.ledger().timestamp() + 86400 * 30), // 30 days from now
+            &symbol_short!("donor1"),
+            &symbol_short!("loc1"),
+        );
+
+        assert_eq!(id, 1);
+    }
+
+    #[test]
+    fn test_query_by_blood_type_basic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(HealthChainContract, ());
+        let client = HealthChainContractClient::new(&env, &contract_id);
+
+        let current_time = env.ledger().timestamp();
+
+        // Add multiple blood units
+        client.add_blood_unit(
+            &BloodType::OPositive,
+            &100,
+            &(current_time + 86400 * 30),
+            &symbol_short!("donor1"),
+            &symbol_short!("loc1"),
+        );
+
+        client.add_blood_unit(
+            &BloodType::OPositive,
+            &50,
+            &(current_time + 86400 * 15),
+            &symbol_short!("donor2"),
+            &symbol_short!("loc1"),
+        );
+
+        client.add_blood_unit(
+            &BloodType::APositive,
+            &75,
+            &(current_time + 86400 * 20),
+            &symbol_short!("donor3"),
+            &symbol_short!("loc2"),
+        );
+
+        // Query O+ blood
+        let results = client.query_by_blood_type(&BloodType::OPositive, &0, &10);
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_query_excludes_expired() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(HealthChainContract, ());
+        let client = HealthChainContractClient::new(&env, &contract_id);
+
+        let current_time = env.ledger().timestamp();
+
+        // Add expired unit (expiration = 0, which is before current_time)
+        client.add_blood_unit(
+            &BloodType::OPositive,
+            &100,
+            &0, // Already expired
+            &symbol_short!("donor1"),
+            &symbol_short!("loc1"),
+        );
+
+        // Add valid unit
+        client.add_blood_unit(
+            &BloodType::OPositive,
+            &50,
+            &(current_time + 86400 * 15),
+            &symbol_short!("donor2"),
+            &symbol_short!("loc1"),
+        );
+
+        let results = client.query_by_blood_type(&BloodType::OPositive, &0, &10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results.get(0).unwrap().quantity, 50);
+    }
+
+    #[test]
+    fn test_query_min_quantity_filter() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(HealthChainContract, ());
+        let client = HealthChainContractClient::new(&env, &contract_id);
+
+        let current_time = env.ledger().timestamp();
+
+        client.add_blood_unit(
+            &BloodType::OPositive,
+            &100,
+            &(current_time + 86400 * 30),
+            &symbol_short!("donor1"),
+            &symbol_short!("loc1"),
+        );
+
+        client.add_blood_unit(
+            &BloodType::OPositive,
+            &25,
+            &(current_time + 86400 * 15),
+            &symbol_short!("donor2"),
+            &symbol_short!("loc1"),
+        );
+
+        // Query with min_quantity = 50
+        let results = client.query_by_blood_type(&BloodType::OPositive, &50, &10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results.get(0).unwrap().quantity, 100);
+    }
+
+    #[test]
+    fn test_query_fifo_sorting() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(HealthChainContract, ());
+        let client = HealthChainContractClient::new(&env, &contract_id);
+
+        let current_time = env.ledger().timestamp();
+
+        // Add units with different expiration dates (not in order)
+        client.add_blood_unit(
+            &BloodType::OPositive,
+            &100,
+            &(current_time + 86400 * 30), // Expires last
+            &symbol_short!("donor1"),
+            &symbol_short!("loc1"),
+        );
+
+        client.add_blood_unit(
+            &BloodType::OPositive,
+            &50,
+            &(current_time + 86400 * 10), // Expires first
+            &symbol_short!("donor2"),
+            &symbol_short!("loc1"),
+        );
+
+        client.add_blood_unit(
+            &BloodType::OPositive,
+            &75,
+            &(current_time + 86400 * 20), // Expires middle
+            &symbol_short!("donor3"),
+            &symbol_short!("loc1"),
+        );
+
+        let results = client.query_by_blood_type(&BloodType::OPositive, &0, &10);
+        assert_eq!(results.len(), 3);
+
+        // Verify FIFO order (earliest expiration first)
+        assert_eq!(results.get(0).unwrap().quantity, 50);
+        assert_eq!(results.get(1).unwrap().quantity, 75);
+        assert_eq!(results.get(2).unwrap().quantity, 100);
+    }
+
+    #[test]
+    fn test_query_pagination() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(HealthChainContract, ());
+        let client = HealthChainContractClient::new(&env, &contract_id);
+
+        let current_time = env.ledger().timestamp();
+
+        // Add 5 units
+        for i in 1..=5 {
+            client.add_blood_unit(
+                &BloodType::OPositive,
+                &(i * 10),
+                &(current_time + 86400 * i as u64),
+                &symbol_short!("donor"),
+                &symbol_short!("loc1"),
+            );
+        }
+
+        // Query with max_results = 2
+        let results = client.query_by_blood_type(&BloodType::OPositive, &0, &2);
+        assert_eq!(results.len(), 2);
+
+        // Query with max_results = 0 (should return all)
+        let all_results = client.query_by_blood_type(&BloodType::OPositive, &0, &0);
+        assert_eq!(all_results.len(), 5);
+    }
+
+    #[test]
+    fn test_query_no_results() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(HealthChainContract, ());
+        let client = HealthChainContractClient::new(&env, &contract_id);
+
+        // Query without adding any units
+        let results = client.query_by_blood_type(&BloodType::OPositive, &0, &10);
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_check_availability_sufficient() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(HealthChainContract, ());
+        let client = HealthChainContractClient::new(&env, &contract_id);
+
+        let current_time = env.ledger().timestamp();
+
+        client.add_blood_unit(
+            &BloodType::OPositive,
+            &100,
+            &(current_time + 86400 * 30),
+            &symbol_short!("donor1"),
+            &symbol_short!("loc1"),
+        );
+
+        client.add_blood_unit(
+            &BloodType::OPositive,
+            &50,
+            &(current_time + 86400 * 15),
+            &symbol_short!("donor2"),
+            &symbol_short!("loc1"),
+        );
+
+        // Check for 120 units (should be available: 100 + 50 = 150)
+        let available = client.check_availability(&BloodType::OPositive, &120);
+        assert_eq!(available, true);
+    }
+
+    #[test]
+    fn test_check_availability_insufficient() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(HealthChainContract, ());
+        let client = HealthChainContractClient::new(&env, &contract_id);
+
+        let current_time = env.ledger().timestamp();
+
+        client.add_blood_unit(
+            &BloodType::OPositive,
+            &100,
+            &(current_time + 86400 * 30),
+            &symbol_short!("donor1"),
+            &symbol_short!("loc1"),
+        );
+
+        // Check for 200 units (only 100 available)
+        let available = client.check_availability(&BloodType::OPositive, &200);
+        assert_eq!(available, false);
+    }
+
+    #[test]
+    fn test_check_availability_excludes_expired() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(HealthChainContract, ());
+        let client = HealthChainContractClient::new(&env, &contract_id);
+
+        let current_time = env.ledger().timestamp();
+
+        // Add expired unit (expiration = 0, which is before current_time)
+        client.add_blood_unit(
+            &BloodType::OPositive,
+            &100,
+            &0, // Already expired
+            &symbol_short!("donor1"),
+            &symbol_short!("loc1"),
+        );
+
+        // Add valid unit
+        client.add_blood_unit(
+            &BloodType::OPositive,
+            &50,
+            &(current_time + 86400 * 15),
+            &symbol_short!("donor2"),
+            &symbol_short!("loc1"),
+        );
+
+        // Check for 75 units (only 50 available, expired doesn't count)
+        let available = client.check_availability(&BloodType::OPositive, &75);
+        assert_eq!(available, false);
+
+        // Check for 50 units (should be available)
+        let available = client.check_availability(&BloodType::OPositive, &50);
+        assert_eq!(available, true);
+    }
+
+    #[test]
+    fn test_check_availability_no_inventory() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(HealthChainContract, ());
+        let client = HealthChainContractClient::new(&env, &contract_id);
+
+        // Check without adding any units
+        let available = client.check_availability(&BloodType::OPositive, &1);
+        assert_eq!(available, false);
     }
 }
