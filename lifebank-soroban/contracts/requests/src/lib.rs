@@ -15,7 +15,6 @@ pub use crate::types::{
 use soroban_sdk::{contract, contractimpl, Address, Env, Map, String, Vec};
 use crate::error::ContractError;
 use crate::types::{BloodRequest, BloodType, RequestMetadata, RequestStatus, UrgencyLevel};
-use soroban_sdk::{contract, contractimpl, Address, Env, String};
 
 #[contract]
 pub struct RequestContract;
@@ -27,7 +26,6 @@ impl RequestContract {
     /// # Arguments
     /// * `env` - Contract environment
     /// * `admin` - Admin address who can manage hospitals and approve requests
-    /// * `admin` - Admin address who can authorize hospitals and blood banks
     ///
     /// # Errors
     /// - `AlreadyInitialized`: Contract has already been initialized
@@ -88,11 +86,6 @@ impl RequestContract {
 
         storage::revoke_hospital(&env, &hospital);
 
-        if env.storage().instance().has(&types::DataKey::Admin) {
-            return Err(ContractError::AlreadyInitialized);
-        }
-
-        storage::set_admin(&env, &admin);
         Ok(())
     }
 
@@ -100,12 +93,6 @@ impl RequestContract {
     ///
     /// # Arguments
     /// * `env` - Contract environment
-    /// * `hospital_id` - Hospital submitting the request (must be authorized)
-    /// * `blood_type` - Type of blood needed
-    /// * `quantity_ml` - Quantity needed in milliliters (100-10000ml)
-    /// * `urgency` - Urgency level (Critical, Urgent, Normal)
-    /// * `required_by` - Unix timestamp when blood is required
-    /// * `delivery_address` - Physical address for delivery
     /// * `hospital_id` - Hospital requesting blood (must be authorized)
     /// * `blood_type` - Type of blood requested
     /// * `quantity_ml` - Quantity in milliliters (50-5000ml)
@@ -123,13 +110,11 @@ impl RequestContract {
     /// - `NotInitialized`: Contract not initialized
     /// - `NotAuthorizedHospital`: Hospital is not authorized
     /// - `InvalidQuantity`: Quantity outside acceptable range
-    /// - `InvalidRequiredBy`: Invalid required_by timestamp
-    /// - `InvalidDeliveryAddress`: Empty delivery address
+    /// - `InvalidTimestamp`: Required_by timestamp is invalid
+    /// - `InvalidInput`: Delivery address is empty
     ///
     /// # Events
     /// Emits `RequestCreated` event with all request details
-    /// - `InvalidTimestamp`: Required_by timestamp is invalid
-    /// - `InvalidInput`: Delivery address is empty
     pub fn create_request(
         env: Env,
         hospital_id: Address,
@@ -147,7 +132,6 @@ impl RequestContract {
 
         // 2. Check contract is initialized
         if !storage::is_initialized(&env) {
-        if !env.storage().instance().has(&types::DataKey::Admin) {
             return Err(ContractError::NotInitialized);
         }
 
@@ -156,33 +140,26 @@ impl RequestContract {
             return Err(ContractError::NotAuthorizedHospital);
         }
 
-        // 4. Validate input parameters
-        validation::validate_request_creation(&env, quantity_ml, required_by, &delivery_address)?;
-
-        // 5. Validate urgency-specific time window
-        validation::validate_urgency_time_window(&env, required_by, urgency.priority_weight())?;
-
-        // 6. Generate unique request ID
-        let request_id = storage::increment_request_id(&env);
-
-        // 7. Create blood request struct
-        let current_time = env.ledger().timestamp();
         // 4. Validate request parameters
         validation::validate_request_creation(&env, quantity_ml, required_by)?;
         validation::validate_delivery_address(&delivery_address)?;
         validation::validate_blood_type(&blood_type)?;
 
-        // 5. Generate request ID
+        // 5. Validate urgency-specific time window
+        validation::validate_urgency_time_window(&env, required_by, urgency.priority_weight())?;
+
+        // 6. Generate request ID
         let request_id = storage::increment_request_id(&env);
         let current_time = env.ledger().timestamp();
 
-        // 6. Create request
+        // 7. Create request metadata
         let metadata = RequestMetadata {
             patient_id,
             procedure,
             notes,
         };
 
+        // 8. Create blood request
         let request = BloodRequest {
             id: request_id,
             hospital_id: hospital_id.clone(),
@@ -198,31 +175,19 @@ impl RequestContract {
             metadata: Map::new(&env),
         };
 
-        // 8. Validate the complete request
+        // 9. Validate the complete request
         request.validate(current_time)?;
 
-        // 9. Store request
+        // 10. Store request
         storage::set_blood_request(&env, &request);
 
-        // 10. Update indexes for efficient querying
+        // 11. Update indexes for efficient querying
         storage::add_to_hospital_index(&env, &request);
         storage::add_to_blood_type_index(&env, &request);
         storage::add_to_status_index(&env, &request);
         storage::add_to_urgency_index(&env, &request);
 
-        // 11. Emit event
-            assigned_units: soroban_sdk::vec![&env],
-            delivery_address,
-            metadata,
-        };
-
-        // 7. Validate request
-        request.validate(current_time)?;
-
-        // 8. Store request
-        storage::set_blood_request(&env, &request);
-
-        // 9. Emit event
+        // 12. Emit event
         events::emit_request_created(
             &env,
             request_id,
@@ -233,7 +198,7 @@ impl RequestContract {
             required_by,
         );
 
-        // 12. Return request ID
+        // 13. Return request ID
         Ok(request_id)
     }
 
@@ -247,9 +212,9 @@ impl RequestContract {
     /// Blood request details
     ///
     /// # Errors
-    /// - `NotFound`: Request with given ID doesn't exist
+    /// - `RequestNotFound`: Request with given ID doesn't exist
     pub fn get_request(env: Env, request_id: u64) -> Result<BloodRequest, ContractError> {
-        storage::get_blood_request(&env, request_id).ok_or(ContractError::NotFound)
+        storage::get_blood_request(&env, request_id).ok_or(ContractError::RequestNotFound)
     }
 
     /// Approve a pending blood request
@@ -293,7 +258,8 @@ impl RequestContract {
 
         // Emit event
         events::emit_request_approved(&env, request_id);
-        Ok(request_id)
+        
+        Ok(())
     }
 
     /// Update request status
@@ -386,6 +352,10 @@ impl RequestContract {
 
         // Emit event
         events::emit_request_cancelled(&env, request_id, old_status);
+
+        Ok(())
+    }
+
     /// Assign blood units to a request
     ///
     /// # Arguments
@@ -478,19 +448,6 @@ impl RequestContract {
     /// true if authorized, false otherwise
     pub fn is_hospital_authorized(env: Env, hospital: Address) -> bool {
         storage::is_authorized_hospital(&env, &hospital)
-    /// Get a blood request by ID
-    ///
-    /// # Arguments
-    /// * `env` - Contract environment
-    /// * `request_id` - ID of request to retrieve
-    ///
-    /// # Returns
-    /// The blood request if found
-    ///
-    /// # Errors
-    /// - `RequestNotFound`: Request does not exist
-    pub fn get_request(env: Env, request_id: u64) -> Result<BloodRequest, ContractError> {
-        storage::get_blood_request(&env, request_id).ok_or(ContractError::RequestNotFound)
     }
 }
 
