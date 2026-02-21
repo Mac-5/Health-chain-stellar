@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { JwtModule, JwtService } from '@nestjs/jwt';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import Redis from 'ioredis';
+import RedisMock from 'ioredis-mock';
 import { AuthService } from './auth.service';
 import { REDIS_CLIENT } from '../redis/redis.constants';
 import { UnauthorizedException } from '@nestjs/common';
@@ -28,11 +29,7 @@ describe('AuthService - Refresh Token Race Condition (Integration)', () => {
         {
           provide: REDIS_CLIENT,
           useFactory: () => {
-            return new Redis({
-              host: 'localhost',
-              port: 6379,
-              db: 15, // Use separate DB for tests
-            });
+            return new RedisMock();
           },
         },
       ],
